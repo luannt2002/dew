@@ -131,6 +131,19 @@ var contextOverflowText = []string{
 	"input too long", "range of input length", "maximum allowed input length", "input token count",
 }
 
+// isContextOverflow: provider từ chối vì prompt vượt context window. Mẫu câu của
+// fantasy bỏ sót vLLM sau LiteLLM ("requested 8192 output tokens"), nên xét thêm
+// chữ của thông điệp.
+func isContextOverflow(err error) bool {
+	// Lỗi của tool (kể cả agent con tràn context) không phải lịch sử của lượt này tràn.
+	var toolErr *fantasy.ToolExecutionError
+	var pe *fantasy.ProviderError
+	if errors.As(err, &toolErr) || !errors.As(err, &pe) {
+		return false
+	}
+	return pe.IsContextTooLarge() || hasAny(strings.ToLower(pe.Message), contextOverflowText)
+}
+
 // cloudflareErrorBody là thân trả lời của Cloudflare cho client không nhận HTML (524...).
 var cloudflareErrorBody = regexp.MustCompile(`^error code: (5\d\d)\b`)
 

@@ -405,10 +405,11 @@ type sessionAgent struct {
 	// canceledRuns ghi các RunID bị CancelRun huỷ trước khi lượt của chúng
 	// tới Run (request gửi prompt còn đang bay), kèm thời điểm ghi để dọn.
 	canceledRuns *csync.Map[string, time.Time]
-	// summarizeFailed đánh dấu session vừa tự tóm tắt hỏng: tạm tắt tự tóm
-	// tắt cho tới prompt mới của người dùng, để lượt làm tiếp không lặp lại
-	// bước tóm tắt hỏng (mỗi lần mất cả hạn chờ) ở từng bước.
-	summarizeFailed *csync.Map[string, bool]
+	// summarizeFailed ghi số token của session lúc tự tóm tắt hỏng: tạm tắt tự
+	// tóm tắt cho tới prompt mới của người dùng hoặc tới khi context lớn thêm
+	// nửa ngưỡng, để lượt làm tiếp không lặp lại bước tóm tắt hỏng (mỗi lần mất
+	// cả hạn chờ) ở từng bước mà cũng không chạy thẳng tới trần thật của model.
+	summarizeFailed *csync.Map[string, int64]
 	// dispatchMuCreate guards lazy creation of per-session entries in
 	// dispatchMu so two goroutines can't race to lock different mutex
 	// instances for the same session.
@@ -470,7 +471,7 @@ func NewSessionAgent(
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
 		canceledRuns:         csync.NewMap[string, time.Time](),
-		summarizeFailed:      csync.NewMap[string, bool](),
+		summarizeFailed:      csync.NewMap[string, int64](),
 	}
 }
 
@@ -1138,6 +1139,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 
 	var stepMessages []fantasy.Message
 	var shouldSummarize, looping, summaryCapHit bool
+	// summarizeAt: số token của session lúc quyết định tự tóm tắt.
+	var summarizeAt int64
 	var overflow *contextOverflowError
 	sanitizedToolCalls := make(map[string]bool)
 	// Full names of tool calls that completed without error this turn.
@@ -1468,7 +1471,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				} else {
 					threshold = int64(float64(cw) * smallContextWindowRatio)
 				}
-				_, suppressed := a.summarizeFailed.Get(call.SessionID)
+				failedAt, suppressed := a.summarizeFailed.Get(call.SessionID)
+				suppressed = suppressed && tokens < failedAt+threshold/2
 				if (remaining <= threshold) && !a.disableAutoSummarize && !suppressed {
 					if call.afterSummary && len(steps) == 1 {
 						// Bước đầu sau tóm tắt không gọi tool thì lượt tự kết thúc.
@@ -1489,6 +1493,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 						return true
 					}
 					shouldSummarize = true
+					summarizeAt = tokens
 					return true
 				}
 				return false
@@ -1693,6 +1698,33 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		if updateErr != nil {
 			return nil, updateErr
 		}
+		// Provider báo tràn context: session đã vượt trần thật (tóm tắt trước đó
+		// hỏng, hoặc window khai lớn hơn thật). Ngưỡng chỉ được xét sau một bước
+		// thành công, nên không gỡ ở đây thì mọi prompt sau cũng tràn ngay request
+		// đầu. Tràn ngay ở lượt vừa tóm tắt xong (chưa chạy xong tool nào) thì tóm
+		// tắt nữa không giúp: để lỗi đi tiếp.
+		if isContextOverflow(err) && !a.disableAutoSummarize && genCtx.Err() == nil &&
+			call.summaries < maxAutoSummaries && (!call.afterSummary || len(completedToolCalls) > 0) {
+			a.activeRequests.Del(call.SessionID)
+			if summarizeErr := a.summarize(genCtx, call.SessionID, call.ProviderOptions, call.OnAuthRefresh, largeModel, call.RunID, false); errors.Is(summarizeErr, context.Canceled) || ctx.Err() != nil {
+				// Bị huỷ lúc đang tóm tắt: lượt dừng như huỷ, không như lỗi tràn.
+				return afterError(nil, cmp.Or(summarizeErr, ctx.Err()))
+			} else if summarizeErr != nil {
+				slog.Warn("Summarize after context overflow failed", "session_id", call.SessionID, "error", summarizeErr)
+			} else {
+				next := call
+				next.originalPrompt = cmp.Or(call.originalPrompt, call.Prompt)
+				next.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", next.originalPrompt)
+				next.continuation = true
+				next.produced = produced
+				next.afterSummary = true
+				next.summaries++
+				next.Attachments = nil
+				existing, _ := a.messageQueue.Get(call.SessionID)
+				a.messageQueue.Set(call.SessionID, append([]SessionAgentCall{next}, existing...))
+				return afterError(nil, nil)
+			}
+		}
 		// A channel-originated turn has no caller watching the error, so
 		// tell the channel side something went wrong instead of leaving
 		// the sender hanging. sendChannelReply detaches from the run
@@ -1735,12 +1767,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			// Tóm tắt hỏng (provider im lặng quá hạn, mạng, lỗi API): KHÔNG
 			// dừng việc. Lịch sử còn nguyên (bản tóm tắt hỏng không thành
 			// điểm cắt) và lúc này còn khoảng 20% context, nên làm tiếp như
-			// khi tóm tắt xong; tự tóm tắt tạm tắt cho tới prompt mới để lượt
-			// làm tiếp không lặp lại bước hỏng. Context có đầy thật thì
-			// provider báo lỗi và lượt dừng với lỗi đó.
+			// khi tóm tắt xong; tự tóm tắt tạm tắt cho tới prompt mới hoặc tới
+			// khi context lớn thêm nửa ngưỡng, để lượt làm tiếp không lặp lại
+			// bước hỏng ở từng bước. Provider vẫn báo tràn thì nhánh lỗi tóm
+			// tắt rồi làm tiếp (isContextOverflow).
 			slog.Warn("Auto-summarize failed; continuing the turn without it",
 				"session_id", call.SessionID, "error", summarizeErr)
-			a.summarizeFailed.Set(call.SessionID, true)
+			a.summarizeFailed.Set(call.SessionID, summarizeAt)
 			summaryFailure = summarizeErr
 		}
 		// If the agent wasn't done...

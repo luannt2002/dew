@@ -9,6 +9,15 @@ Quy trình phát hành: xem [CLAUDE.md](CLAUDE.md), mục P6.
 
 ## [Unreleased]
 
+### Sửa
+
+- **Session vượt trần thật của model được tự tóm tắt thay vì kẹt.** Sự cố 03/11 (qwen3.8, trần 200K): tự tóm tắt
+  hỏng một lần (provider im 6 phút) thì tự tóm tắt tắt suốt chuỗi làm tiếp, context chạy từ ~102K tới 191K, rồi mọi prompt
+  sau đều bị từ chối ngay request đầu. Nay tóm tắt hỏng chỉ tạm tắt tới khi context lớn thêm nửa ngưỡng (rồi thử lại), và
+  lỗi tràn context của provider (kể cả câu của vLLM sau LiteLLM mà fantasy không nhận ra) dẫn tới tóm tắt rồi làm tiếp.
+  Tràn ngay ở lượt vừa tóm tắt xong, chính bước tóm tắt cũng hỏng hay tràn, hoặc đã tắt tự tóm tắt, thì lượt vẫn dừng với
+  lỗi như trước.
+
 ## [0.3.3] - 2026-10-22
 
 Làm theo [audit mã 22/10](reports/DEW_CODE_AUDIT_2026-10-22.md): đóng các lối thoát vô tình khỏi worktree khi không người

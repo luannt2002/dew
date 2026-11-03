@@ -349,11 +349,13 @@ cũng ghi được và tên socket đoán được. `DEW_RUNTIME_DIR` bạn tự
   ít nhất một tool call thì đếm lại từ đầu). Lượt làm tiếp chạy trước prompt bạn gõ thêm sau đó. Ngân sách mặc định của provider `main` là
   min(32000, `DEW_CONTEXT_WINDOW`/4); đặt `DEW_MAX_TOKENS` để đổi.
 - Tự tóm tắt khi phần context còn trống ≤ 20% context window (window ≤ 200k token) hoặc ≤ 20.000 token (window
-  lớn hơn); model không khai `context_window` thì không bao giờ tự tóm tắt. Bước tóm tắt có hạn chờ gấp 3
+  lớn hơn); model không khai `context_window` thì không tự tóm tắt theo ngưỡng (chỉ tóm tắt khi provider báo tràn context). Bước tóm tắt có hạn chờ gấp 3
   `request-timeout` (mặc định 6 phút). Tóm
   tắt vẫn hỏng thì việc không dừng: lịch sử giữ nguyên, lượt làm tiếp chạy ngay (tin "Continue the task
-  where you stopped..."), tự tóm tắt tạm tắt cho session tới prompt sau của bạn. Context đầy thật thì
-  provider báo lỗi và lượt dừng với lỗi đó; khi đó tóm tắt tay (`Ctrl+P` → Summarize) hoặc mở session mới.
+  where you stopped..."), tự tóm tắt tạm tắt cho session tới prompt sau của bạn hoặc tới khi context lớn
+  thêm nửa ngưỡng (khi đó thử lại). Provider báo tràn context (kể cả ngay request đầu của prompt mới) thì
+  dew tóm tắt rồi làm tiếp; tràn ngay ở lượt vừa tóm tắt xong, hoặc chính bước tóm tắt cũng hỏng, thì lượt
+  dừng với lỗi của provider; khi đó tóm tắt tay (`Ctrl+P` → Summarize) hoặc mở session mới.
   Bản tóm tắt bị cắt vì hết ngân sách output cũng tính là hỏng (không thay lịch sử). Tóm tắt xong mà riêng
   phần đầu vào của bước đầu ở lượt làm tiếp đã vượt ngưỡng, và việc còn dở (bước đó còn gọi tool), thì lượt dừng
   với lỗi `context window too small…` thay vì tóm tắt lại mãi (phần cố định của prompt quá lớn so với window).
